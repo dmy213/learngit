@@ -1,0 +1,253 @@
+% =========================================================================
+% -- PRojection Onto the conveX hull (PrOX)
+% -- JED in large SIMO Simulator
+% -------------------------------------------------------------------------
+% -- (c) 2017 Christoph Studer and Oscar Castada
+% -- e-mail: studer@cornell.edu and oc66@cornell.edu
+% -------------------------------------------------------------------------
+% -- If you use this simulator or parts of it, then you must cite our 
+% -- paper: 
+% -- Oscar Castada, Tom Goldstein, and Christoph Studer,
+% -- "VLSI Designs for Joint Channel Estimation and Data Detection in Large
+% -- SIMO Wireless Systems,"
+% -- IEEE Transactions on Circuits and Systems I: Regular Papers,
+% -- vol. 65, no. 3, pp. 1120-1132, April. 2020.
+% =========================================================================
+
+function MIMO(varargin)
+
+  % -- set up default/custom parameters
+  
+ if isempty(varargin)
+    
+    disp('using default simulation settings and parameters...')
+        
+    % 设置缺省的仿真参数
+    par.runId = 0;        % 仿真ID，用于重现仿真结果
+    par.MR = 4;          % 接受天线数目
+    par.MT = 4;        % 发射天线数目（不能长于MR）
+    par.Time = 8;        % 发射信号的时隙
+    par.training = 4;    %上行链路的导频长度 par.training的长度需要大于等于par.MR才能准确估计H
+    par.mod = '4QAM';     % 调制模式: 'BPSK','QPSK','4QAM','16QAM','64QAM','256QAM'
+    par.trials = 1e4;      % number of Monte-Carlo trials (transmissions)(蒙特卡洛判决次数)
+    par.simName = ...      % 仿真命名（用于存储结果）
+      ['NCERR_' num2str(par.MR) 'x' num2str(par.MT) '_' ...
+      num2str(par.Time), 'TS_', par.mod, '_', ...
+      num2str(par.trials), 'Trials'];    
+    par.SNRdB_list = ...  % 仿真的SNR值
+      4:2:16;
+    par.detector = ...    % 译码器
+      {'MRC-CSIR','MRC','EP-CSIR','EP'};%添加译码器的类型
+   par.EP.iterNum = 10;
+   par.CE=...
+       {'perfect-CSI','LS','LMMSE'};%添加信道估计的方法：LS，LMMSE和perfect-CSI
+  else
+      
+    disp('use custom simulation settings and parameters...')    
+    par = varargin{1}; % only argument is par structure
+    
+ end
+ %随机数种子，调整runID调用不同的随机数种子
+  rng(par.runId);
+  
+%% 星座图参数
+  %星座图向量表+发射功率归一化
+  switch (par.mod)
+    case 'BPSK',
+      par.symbols = [ -1 1 ];
+    case 'QPSK', 
+      par.symbols = [ -1-1i,-1+1i,1-1i,+1+1i ]/sqrt(2);
+    case'4QAM',
+         par.symbols = qammod(0:3,4,'gray')/sqrt(2);  
+         norm_f=1/sqrt(2);
+         QAM=4;
+    case '16QAM',
+          par.symbols = qammod(0:15,16,'gray')/sqrt(10);
+          norm_f = 1/sqrt(10);
+          QAM=16;
+    case '64QAM',
+          par.symbols = qammod(0:63,64,'gray')/sqrt(42);
+          norm_f=1/sqrt(42);
+          QAM=64;
+    case'256QAM',
+          par.symbols=qammod(0:255,256,'gray')/sqrt(170);
+          QAM=256;
+          norm_f=1/sqrt(170);
+  end
+
+  % 平均发射信号功率（暂时已经归一化）
+  par.Es = mean(abs(par.symbols).^2); 
+
+  % 计算二进制数和十进制数的对应表
+  par.Q = log2(QAM); % 每个符号包含的比特数
+  par.bits = de2bi(0:length(par.symbols)-1,par.Q,'left-msb');
+
+  % 仿真时间估计
+  time_elapsed = 0;
+  % -- 开始仿真
+  
+ %% 初始化信道参数
+  % trials loop
+  tic
+  idx=zeros(par.MT,par.Time);%星座图位置矩阵初始化
+  S=zeros(par.MT,par.Time);%调制后的发射信号初始化
+  S_pilots=Pilot_chu(par);%设计的导频发射序列（缺省为正交的chu序列）
+  
+  Y=zeros(par.MR,par.Time);%接受信号初始化（add noise）
+  Y_pilots=zeros(par.MR,par.Time);%导频接受序列
+  
+  N = sqrt(0.5)*(randn(par.MR,par.Time)+1i*randn(par.MR,par.Time)); %方差为1的复高斯分布
+  N_pilots=sqrt(0.5)*(randn(par.MR,par.training)+1i*randn(par.MR,par.training));%导频传输带来的噪声
+  
+  res.BER = zeros(length(par.detector),length(par.SNRdB_list)); % 误比特率
+  res.EVM = zeros(length(par.detector),length(par.SNRdB_list)); % 功率偏差
+  res.PER = zeros(length(par.detector),length(par.SNRdB_list)); %
+  res.SER = zeros(length(par.detector),length(par.SNRdB_list)); %误符号率
+  res.HMSE = zeros(length(par.detector),length(par.SNRdB_list));%信道估计得额误差
+  
+for ce=1:length(par.CE)
+  for t=1:par.trials
+      
+    par.stop = 0;
+    % 生成随机信号比特流 (antenna x bit x time slots)
+    bits = randi([0 1],par.MT,par.Q,par.Time);
+    
+    %构造输入信号
+    
+    % 生成上行链路信号
+    for time=1:par.Time
+      idx(:,time) = bi2de(bits(:,:,time),'left-msb')+1;
+      S(:,time)=par.symbols(idx(:,time)); % QAM调制
+    end
+    
+    
+    % channel  生成信道，缺省为瑞利信道  
+
+    H = sqrt(0.5)*(randn(par.MR,par.MT)+1i*randn(par.MR,par.MT));
+ 
+%% 检测和估计部分
+
+    % SNR 循环
+    for k=1:length(par.SNRdB_list)   
+        
+       % 在噪声信道上传递数据
+      par.N0 = par.MT*par.Es*10^(-par.SNRdB_list(k)/10);    
+      
+      Y = H*S+sqrt(par.N0)*N;  
+      %添加方差为N0的噪声的信号接受序列  
+      Y_pilots=H*S_pilots+sqrt(par.N0)*N_pilots;  
+      %添加方差为N0的噪声的导频接受序列  
+      
+      switch(par.CE{ce}) %信道估计的方法
+          case'perfect-CSI',
+              Hest =CE_Perfect(H);
+          case 'LS',
+              Hest=CE_LS(S_pilots,Y_pilots,par);
+          case 'LMMSE',
+              Hest=CE_LMMSE(S_pilots,Y_pilots,par);
+      end
+      % algorithm 循环 
+      % 其中bithat：解调后的输入信号估计值；xhat：解调前的输入信号估计值
+      
+      for d=1:length(par.detector) 
+        switch (par.detector{d}) % 选择检测算法
+          case 'MRC-CSIR', % MRC with perfect CSIR (no CHEST errors)
+            [idxhat,bithat,htilde,xhat] = MRC(par,H,Y,S,0);   
+             res.EVM(d,k)= res.EVM(d,k)+sum(abs(xhat-S).^2)/sum(abs(S).^2);
+          case 'MRC',      % MRC with imperfect CSIR
+            [idxhat,bithat,htilde,xhat] = MRC(par,Hest,Y,S,0); 
+             res.EVM(d,k)= res.EVM(d,k)+sum(abs(xhat-S).^2)/sum(abs(S).^2);
+          case 'EP-CSIR',   % EP with imperfect CSIR that retrains channel 
+              [idxhat,bithat,xhat] = EP(par,H,Y,S);
+%               res.BER(d,k) = res.BER(d,k) + sum(bits(:)~=bithat(:))/(par.MT*par.Time*par.Q);      
+              res.EVM(d,k)= res.EVM(d,k)+sum(abs(xhat-S).^2)/sum(abs(S).^2);
+          case 'EP',       % EP with imperfect CSIR
+             [idxhat,bithat,xhat] = EP(par,Hest,Y,S);
+%               res.BER(d,k) = res.BER(d,k) + sum(bits(:)~=bithat(:))/(par.MT*par.Time*par.Q);      
+              res.EVM(d,k)= res.EVM(d,k)+sum(abs(xhat-S).^2)/sum(abs(S).^2);
+          otherwise,
+            error('par.detector type not defined.')      
+        end                          
+       err = (idx~=idxhat);
+       res.PER(d,k) = res.PER(d,k) + any(err(:));
+       res.SER(d,k) = res.SER(d,k) + sum(err(:))/par.MT/par.Time;    
+       res.BER(d,k) = res.BER(d,k) + sum(bits(:)~=bithat(:))/(par.MT*par.Time*par.Q);      
+      end % algorithm 循环
+                 
+    end % SNR 循环 
+
+ %% 估计仿真时间   
+    %估计仿真时间
+    if toc>10
+      time=toc;
+      time_elapsed = time_elapsed + time;
+      fprintf('estimated remaining simulation time: %3.0f min.\n',time_elapsed*(par.trials*length(par.CE)/(t+par.trials*(ce-1))-1)/60 );
+      tic
+    end      
+  
+  end % trials loop
+%% 绘制性能图
+
+  res.BER = res.BER/par.trials;
+  res.EVM = res.EVM/par.trials;
+  res.time_elapsed = time_elapsed;
+  
+  % -- 保存最终结果 (par and res structure)
+  save([ par.simName '_' num2str(par.runId) ],'par','res');    
+    
+  % -- 绘制性能图 
+  marker_style = {'bo-','bs--','ko-','ks--'};    
+  figure('Name',par.CE{ce})
+  
+  for d=1:length(par.detector)
+    if d==1
+      semilogy(par.SNRdB_list,res.BER(d,:),marker_style{d},'LineWidth',2)
+      hold on
+    else
+      semilogy(par.SNRdB_list,res.BER(d,:),marker_style{d},'LineWidth',2)
+    end
+  end
+  hold off
+  grid on
+  
+  title(strcat('antenna:',num2str(par.MR),'x',num2str(par.MT),'  pilots:',num2str(par.training)))
+  xlabel('average SNR per receive antenna [dB]','FontSize',12)
+  ylabel('Bit error rate (BER)','FontSize',12)
+  
+  axis([min(par.SNRdB_list) max(par.SNRdB_list) -inf 1])
+  legend(par.detector,'FontSize',12)
+  set(gca,'FontSize',12)
+
+
+end % ce 循环
+ 
+end
+
+% -- MRC检测器的函数 
+
+%% Maximum Ratio Combining (MRC)
+function [idxhat,bithat,htilde,xhat] = MRC(par,H,Y,S,RT)
+  Z = Y-H*S;
+  idxhat=zeros(par.MT,par.Time);
+  bithat=zeros(par.MT,par.Q,par.Time);
+  xhat=zeros(par.MT,par.Time);
+  for time=1:par.Time
+    for m=1:par.MT
+      hm = H(:,m);
+      yhat = Z(:,time)+hm*conj(S(m,time));
+      xhat(m,time) = yhat'*hm/norm(hm,2)^2;
+    end 
+
+    [~,idxhat(:,time)] = min(abs(xhat(:,time)*ones(1,length(par.symbols))-ones(par.MT,1)*par.symbols).^2,[],2);
+    bithat(:,:,time) = par.bits(idxhat(:,time),:);
+  end
+  if(RT)
+    shat = par.symbols(idxhat).';
+    htilde = Y*shat/norm(shat,2)^2;
+  else
+    htilde = H;
+  end    
+end
+
+
+
